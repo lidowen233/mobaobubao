@@ -1,0 +1,85 @@
+generator client {
+  provider             = "prisma-client-py"
+  interface            = "asyncio"
+  recursive_type_depth = 5
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./mojiji.db"
+}
+
+// ── 书法字典 ──────────────────────────────────────────────────────────────────
+
+model Copybook {
+  id            String         @id @default(cuid())
+  title         String
+  calligrapher  String
+  dynasty       String?
+  script        String         @default("KAI")
+  description   String?
+  source        String         @default("SYSTEM")
+  uploaderId    String?
+
+  pages         CopybookPage[]
+
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([calligrapher])
+  @@index([script])
+}
+
+model CopybookPage {
+  id           String    @id @default(cuid())
+  copybookId   String
+  pageNumber   Int       // 1-indexed
+  imageUrl     String    // 整页扫描图路径
+  width        Int       // 该页实际像素宽
+  height       Int       // 该页实际像素高
+  processed    Boolean   @default(false)  // OpenCV 已处理
+
+  copybook     Copybook  @relation(fields: [copybookId], references: [id], onDelete: Cascade)
+  glyphs       Glyph[]
+
+  createdAt    DateTime  @default(now())
+
+  @@unique([copybookId, pageNumber])
+  @@index([copybookId])
+}
+
+model Glyph {
+  id         String   @id @default(cuid())
+  character  String   // 单个汉字 "月"
+  pageId     String
+  imageUrl   String   // 裁切后的单字图片路径
+
+  // bbox 比例坐标 (0.0–1.0)，相对于该页
+  bboxX      Float
+  bboxY      Float
+  bboxW      Float
+  bboxH      Float
+
+  confidence Float?   // OCR 置信度 0-1
+  verified   Boolean  @default(false)  // 人工确认
+  uploaderId String?
+
+  page       CopybookPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime @default(now())
+
+  @@index([character])
+  @@index([pageId])
+}
+
+// ── 用户 ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  role      String   @default("USER")
+  createdAt DateTime @default(now())
+}
+
+

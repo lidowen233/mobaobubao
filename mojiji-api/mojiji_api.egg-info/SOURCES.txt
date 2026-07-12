@@ -1,0 +1,8 @@
+pyproject.toml
+app/config.py
+app/main.py
+mojiji_api.egg-info/PKG-INFO
+mojiji_api.egg-info/SOURCES.txt
+mojiji_api.egg-info/dependency_links.txt
+mojiji_api.egg-info/requires.txt
+mojiji_api.egg-info/top_level.txt
