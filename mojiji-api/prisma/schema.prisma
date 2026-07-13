@@ -5,8 +5,9 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "sqlite" 
   url      = "file:./mojiji.db"
+  
 }
 
 // ── 书法字典 ──────────────────────────────────────────────────────────────────
@@ -67,6 +68,11 @@ model Glyph {
   page       CopybookPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
 
   createdAt  DateTime @default(now())
+  // Permanent traditional reading order
+  orderIndex  Int      @default(0)
+
+  // 0 represents the rightmost vertical column
+  columnIndex Int      @default(0)
 
   @@index([character])
   @@index([pageId])

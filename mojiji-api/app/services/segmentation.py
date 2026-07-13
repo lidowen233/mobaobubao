@@ -15,12 +15,22 @@ import os
 import base64
 import json
 import math
+import io
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
-
+from functools import lru_cache
 import httpx
 
+from dotenv import load_dotenv
+load_dotenv()
+
+@lru_cache(maxsize=2)
+def _load_yolo_model(model_path: str):
+    """Load and cache a YOLO model."""
+    from ultralytics import YOLO
+
+    return YOLO(model_path)
 
 # ============================================================
 # Data model
@@ -41,6 +51,11 @@ class DetectedGlyph:
     h: float
 
     character: str = "?"
+    # Permanent reading-order index
+    order_id: int = -1
+
+    # Column index; 0 is the rightmost column
+    column_id: int = -1
 
     # Model-reported confidence is not a calibrated probability.
     # Keep it optional instead of assigning a fake constant such as 0.9.
@@ -272,84 +287,386 @@ def _remove_duplicate_boxes(
 # RTL column sorting
 # ============================================================
 
+from statistics import median
+
+
 def sort_glyphs_rtl(
     glyphs: list[DetectedGlyph],
-    column_tolerance: float | None = None,
+    *,
+    column_gap_factor: float = 0.75,
+    min_column_tolerance: float = 0.012,
 ) -> list[DetectedGlyph]:
     """
-    Sort glyphs by traditional vertical Chinese reading order:
+    Sort glyphs in traditional vertical Chinese reading order:
 
-        columns: right -> left
-        within each column: top -> bottom
+    1. Columns from right to left.
+    2. Glyphs within each column from top to bottom.
 
-    Nearby x-center coordinates are grouped into the same column.
+    Normalized coordinates make the method independent of image size.
     """
     if not glyphs:
         return []
 
-    widths = sorted(g.w for g in glyphs)
-    median_width = widths[len(widths) // 2]
+    # Use box centers instead of top-left coordinates to reduce width bias.
+    def center_x(g: DetectedGlyph) -> float:
+        return g.x + g.w / 2
 
-    if column_tolerance is None:
-        # A little over half the median glyph width generally works for
-        # vertical copybook columns.
-        column_tolerance = max(0.012, median_width * 0.65)
+    def center_y(g: DetectedGlyph) -> float:
+        return g.y + g.h / 2
 
-    # Start from rightmost glyphs.
-    candidates = sorted(
+    median_width = median(g.w for g in glyphs)
+
+    # Allow moderate horizontal variation within the same column.
+    column_tolerance = max(
+        min_column_tolerance,
+        median_width * column_gap_factor,
+    )
+
+    # Process candidates from the rightmost side first.
+    pending = sorted(
         glyphs,
-        key=lambda g: (-(g.x + g.w / 2), g.y),
+        key=lambda g: (-center_x(g), center_y(g)),
     )
 
     columns: list[list[DetectedGlyph]] = []
-    column_centers: list[float] = []
 
-    for glyph in candidates:
-        center_x = glyph.x + glyph.w / 2
+    for glyph in pending:
+        gx = center_x(glyph)
 
-        best_index: int | None = None
+        best_column_index: int | None = None
         best_distance = float("inf")
 
-        for index, existing_center in enumerate(column_centers):
-            distance = abs(center_x - existing_center)
+        for column_index, column in enumerate(columns):
+            column_center = median(center_x(item) for item in column)
+            distance = abs(gx - column_center)
 
-            if distance <= column_tolerance and distance < best_distance:
-                best_index = index
+            if (
+                distance <= column_tolerance
+                and distance < best_distance
+            ):
+                best_column_index = column_index
                 best_distance = distance
 
-        if best_index is None:
+        if best_column_index is None:
             columns.append([glyph])
-            column_centers.append(center_x)
         else:
-            columns[best_index].append(glyph)
+            columns[best_column_index].append(glyph)
 
-            # Update running column center.
-            column_centers[best_index] = sum(
-                item.x + item.w / 2
-                for item in columns[best_index]
-            ) / len(columns[best_index])
+    # Merge nearby columns that were accidentally split during clustering.
+    columns = _merge_close_columns(
+        columns,
+        column_tolerance=column_tolerance,
+    )
 
-    # Columns right -> left.
-    paired_columns = sorted(
-        zip(column_centers, columns),
-        key=lambda pair: -pair[0],
+    # Sort columns from right to left.
+    columns.sort(
+        key=lambda column: -median(center_x(g) for g in column)
     )
 
     ordered: list[DetectedGlyph] = []
 
-    for _, column in paired_columns:
-        # Each column top -> bottom.
-        ordered.extend(
-            sorted(
-                column,
-                key=lambda g: (
-                    g.y + g.h / 2,
-                    -(g.x + g.w / 2),
-                ),
+    for column_id, column in enumerate(columns):
+        # Sort each column strictly from top to bottom.
+        column.sort(
+            key=lambda g: (
+                center_y(g),
+                -center_x(g),
             )
         )
 
+        for glyph in column:
+            glyph.column_id = column_id
+            glyph.order_id = len(ordered)
+            ordered.append(glyph)
+
     return ordered
+
+
+def _merge_close_columns(
+    columns: list[list[DetectedGlyph]],
+    *,
+    column_tolerance: float,
+) -> list[list[DetectedGlyph]]:
+    """
+    Merge adjacent columns that were split because of horizontal glyph drift.
+    """
+    if len(columns) <= 1:
+        return columns
+
+    def center_x(g: DetectedGlyph) -> float:
+        return g.x + g.w / 2
+
+    columns = sorted(
+        columns,
+        key=lambda column: -median(center_x(g) for g in column),
+    )
+
+    merged: list[list[DetectedGlyph]] = []
+
+    for column in columns:
+        current_center = median(center_x(g) for g in column)
+
+        if not merged:
+            merged.append(column)
+            continue
+
+        previous_center = median(
+            center_x(g)
+            for g in merged[-1]
+        )
+
+        if abs(current_center - previous_center) <= column_tolerance:
+            merged[-1].extend(column)
+        else:
+            merged.append(column)
+
+    return merged
+
+
+# ============================================================
+# YOLO detection and box filtering
+# ============================================================
+
+def detect_glyph_boxes_yolo(
+    image_path: Path,
+    model_path: Path,
+    *,
+    conf_threshold: float = 0.20,
+    iou_threshold: float = 0.45,
+    image_size: int = 1280,
+    device: str | int | None = None,
+    glyph_class_id: int = 0,
+) -> list[DetectedGlyph]:
+    """Detect one bounding box per glyph with a custom YOLO model."""
+    import cv2
+    from ultralytics import YOLO
+
+    image_path = Path(image_path)
+    model_path = Path(model_path)
+
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    if not model_path.exists():
+        raise FileNotFoundError(f"YOLO model not found: {model_path}")
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"Cannot read image: {image_path}")
+
+    image_height, image_width = image.shape[:2]
+    #model = YOLO(str(model_path))
+    model = _load_yolo_model(str(model_path.resolve()))
+    
+    kwargs: dict[str, Any] = {
+        "source": str(image_path),
+        "conf": conf_threshold,
+        "iou": iou_threshold,
+        "imgsz": image_size,
+        "verbose": False,
+    }
+    if device is not None:
+        kwargs["device"] = device
+
+    results = model.predict(**kwargs)
+    if not results or results[0].boxes is None:
+        return []
+
+    boxes = results[0].boxes
+    xyxy_boxes = boxes.xyxy.cpu().numpy()
+    confidences = boxes.conf.cpu().numpy()
+    class_ids = boxes.cls.cpu().numpy().astype(int)
+
+    glyphs: list[DetectedGlyph] = []
+    for xyxy, confidence, class_id in zip(xyxy_boxes, confidences, class_ids):
+        if class_id != glyph_class_id:
+            continue
+
+        x1, y1, x2, y2 = map(float, xyxy)
+        x1 = max(0.0, min(x1, image_width - 1))
+        y1 = max(0.0, min(y1, image_height - 1))
+        x2 = max(x1 + 1.0, min(x2, image_width))
+        y2 = max(y1 + 1.0, min(y2, image_height))
+
+        px = int(round(x1))
+        py = int(round(y1))
+        pw = max(1, int(round(x2 - x1)))
+        ph = max(1, int(round(y2 - y1)))
+
+        glyphs.append(DetectedGlyph(
+            px=px,
+            py=py,
+            pw=pw,
+            ph=ph,
+            x=px / image_width,
+            y=py / image_height,
+            w=pw / image_width,
+            h=ph / image_height,
+            confidence=float(confidence),
+        ))
+
+    return glyphs
+
+
+def filter_glyph_boxes(
+    glyphs: list[DetectedGlyph],
+    *,
+    roi: tuple[float, float, float, float] | None = None,
+    min_width: float = 0.006,
+    min_height: float = 0.012,
+    max_width: float = 0.20,
+    max_height: float = 0.30,
+) -> list[DetectedGlyph]:
+    """Filter implausible boxes and optionally keep only boxes inside a ROI."""
+    filtered: list[DetectedGlyph] = []
+
+    for glyph in glyphs:
+        if not (min_width <= glyph.w <= max_width):
+            continue
+        if not (min_height <= glyph.h <= max_height):
+            continue
+
+        center_x = glyph.x + glyph.w / 2
+        center_y = glyph.y + glyph.h / 2
+
+        if roi is not None:
+            left, top, right, bottom = roi
+            if not (left <= center_x <= right and top <= center_y <= bottom):
+                continue
+
+        filtered.append(glyph)
+
+    return _remove_duplicate_boxes(filtered)
+
+
+RECOGNITION_PROMPT = """
+你是一个专业的中国书法单字识别助手。
+
+输入图片是一张带编号的书法单字裁剪表，每个格子上方都有永久 ID。
+
+要求：
+- 识别每个 ID 对应的主要书法汉字。
+- 必须原样返回图片中的 ID，不能重新编号。
+- 每个 ID 必须恰好返回一次。
+- 不要改变字的顺序。
+- 不要根据上下文补写看不清或不存在的字。
+- 忽略石碑纹理、污损、边框和印章碎片。
+- 无法可靠识别时返回 "?"。
+- character 只能包含一个汉字或一个问号。
+
+只返回严格 JSON：
+{
+  "items": [
+    {"id": 0, "character": "大"},
+    {"id": 1, "character": "唐"}
+  ]
+}
+""".strip()
+
+
+def _encode_bytes(data: bytes) -> str:
+    """Encode binary data as base64 text."""
+    return base64.b64encode(data).decode("utf-8")
+
+
+def apply_recognition_results(
+    glyphs: list[DetectedGlyph],
+    parsed: dict[str, Any],
+) -> None:
+    """Map recognized characters back by permanent order_id values."""
+    recognized: dict[int, str] = {}
+
+    for item in parsed.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_id = int(item["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        recognized[item_id] = _clean_character(item.get("character", "?"))
+
+    for glyph in glyphs:
+        glyph.character = recognized.get(glyph.order_id, "?")
+
+
+def recognize_glyph_batch(
+    image_path: Path,
+    glyphs: list[DetectedGlyph],
+    *,
+    model: str = "gpt-4o",
+    timeout: float = 300.0,
+) -> list[DetectedGlyph]:
+    """Recognize a sorted batch and preserve IDs regardless of response order."""
+    if not glyphs:
+        return glyphs
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set in the environment.")
+
+    sheet_bytes = create_glyph_contact_sheet(image_path, glyphs)
+    expected_ids = [glyph.order_id for glyph in glyphs]
+
+    payload = {
+        "model": model,
+        "max_tokens": 4096,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": RECOGNITION_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "识别图中所有编号单字。"
+                            f"必须返回这些永久 ID：{expected_ids}。"
+                            "不要按数组位置重新编号。"
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{_encode_bytes(sheet_bytes)}",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+
+    try:
+        timeout_config = httpx.Timeout(
+            connect=30.0,
+            read=300.0,
+            write=120.0,
+            pool=30.0,
+        )
+
+        with httpx.Client(timeout=timeout_config) as client:
+            response = client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except httpx.TimeoutException as exc:
+        raise TimeoutError(
+            f"Glyph recognition exceeded the request timeout: {exc}"
+        ) from exc
+
+    if response.is_error:
+        raise RuntimeError(
+            f"OpenAI API request failed ({response.status_code}): {response.text}"
+        )
+
+    content = response.json()["choices"][0]["message"]["content"].strip()
+    parsed = json.loads(content)
+    apply_recognition_results(glyphs, parsed)
+    return glyphs
 
 
 # ============================================================
@@ -383,192 +700,130 @@ def _extract_response_text(response_json: dict[str, Any]) -> str:
 def segment_page(
     image_path: Path,
     *,
-    model: str | None = None,
-    timeout: float = 120.0,
+    yolo_model_path: Path,
+    vision_model: str = "gpt-4o",
+    yolo_conf: float = 0.20,
+    yolo_iou: float = 0.45,
+    yolo_image_size: int = 1280,
+    recognition_batch_size: int = 24,
+    device: str | int | None = None,
+    roi: tuple[float, float, float, float] | None = None,
 ) -> list[DetectedGlyph]:
-    """
-    Send a copybook page to an OpenAI vision model and return glyphs.
 
-    Environment variables:
-        OPENAI_API_KEY
-        OPENAI_VISION_MODEL, optional
-
-    A model supporting image inputs and Structured Outputs is required.
-    """
-    image_path = Path(image_path)
-
-    if not image_path.exists():
-        raise FileNotFoundError(image_path)
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "OPENAI_API_KEY is not set in the environment."
-        )
-
-    model = (
-        model
-        or os.getenv("OPENAI_VISION_MODEL")
-        or "gpt-5.6"
+    # 1. YOLO detects bounding boxes only.
+    glyphs = detect_glyph_boxes_yolo(
+        image_path=image_path,
+        model_path=yolo_model_path,
+        conf_threshold=yolo_conf,
+        iou_threshold=yolo_iou,
+        image_size=yolo_image_size,
+        device=device,
     )
 
-    image_width, image_height = _get_image_size(image_path)
+    # 2. Remove implausible or duplicate boxes.
+    glyphs = filter_glyph_boxes(glyphs, roi=roi)
 
-    b64 = _encode_image(image_path)
-    media_type = _get_media_type(image_path)
-    data_url = f"data:{media_type};base64,{b64}"
-
-    payload = {
-        "model": model,
-        "instructions": SYSTEM_PROMPT,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "检测这张书法字帖正文中的每一个独立汉字。"
-                            "不要识别右侧题签、印章、边框和编辑信息。"
-                            "边界框必须使用相对于整张原图的坐标。"
-                        ),
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": data_url,
-                        # Dense calligraphy pages are spatially sensitive.
-                        # gpt-5.4+ models support "original".
-                        "detail": "original",
-                    },
-                ],
-            }
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "calligraphy_glyph_detection",
-                "strict": True,
-                "schema": GLYPH_SCHEMA,
-            }
-        },
-        "max_output_tokens": 12000,
-    }
-
-    try:
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(
-                "https://api.openai.com/v1/responses",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-
-            if response.is_error:
-                raise RuntimeError(
-                    "OpenAI API request failed "
-                    f"({response.status_code}): {response.text}"
-                )
-
-    except httpx.TimeoutException as exc:
-        raise TimeoutError(
-            f"OpenAI request exceeded {timeout} seconds."
-        ) from exc
-
-    response_json = response.json()
-    content = _extract_response_text(response_json)
-
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Model returned invalid JSON: {content[:500]}"
-        ) from exc
-
-    raw_glyphs = parsed.get("glyphs")
-
-    if not isinstance(raw_glyphs, list):
-        raise ValueError("Response field 'glyphs' is not a list.")
-
-    glyphs: list[DetectedGlyph] = []
-
-    for item in raw_glyphs:
-        if not isinstance(item, dict):
-            continue
-
-        required_values = [
-            item.get("x"),
-            item.get("y"),
-            item.get("w"),
-            item.get("h"),
-        ]
-
-        if not all(_is_valid_number(v) for v in required_values):
-            continue
-
-        gx = float(item["x"])
-        gy = float(item["y"])
-        gw = float(item["w"])
-        gh = float(item["h"])
-
-        # Completely invalid boxes.
-        if gw <= 0 or gh <= 0:
-            continue
-
-        # Boxes whose origin is far outside the image.
-        if gx >= 1 or gy >= 1:
-            continue
-
-        # Clamp slightly inaccurate coordinates to the image boundary.
-        gx = _clamp(gx, 0.0, 1.0)
-        gy = _clamp(gy, 0.0, 1.0)
-        gw = _clamp(gw, 0.0, 1.0 - gx)
-        gh = _clamp(gh, 0.0, 1.0 - gy)
-
-        # Reject boxes that become empty after clipping.
-        if gw < 0.002 or gh < 0.002:
-            continue
-
-        # Reject implausibly huge boxes. A single calligraphy glyph should
-        # not occupy most of the page.
-        if gw > 0.35 or gh > 0.45:
-            continue
-
-        character = _clean_character(item.get("character"))
-
-        px = round(gx * image_width)
-        py = round(gy * image_height)
-        pw = max(1, round(gw * image_width))
-        ph = max(1, round(gh * image_height))
-
-        # Ensure pixel boxes remain inside the original image.
-        px = min(max(px, 0), image_width - 1)
-        py = min(max(py, 0), image_height - 1)
-        pw = min(pw, image_width - px)
-        ph = min(ph, image_height - py)
-
-        glyphs.append(
-            DetectedGlyph(
-                px=px,
-                py=py,
-                pw=pw,
-                ph=ph,
-                x=gx,
-                y=gy,
-                w=gw,
-                h=gh,
-                character=character,
-                confidence=None,
-            )
-        )
-
-    glyphs = _remove_duplicate_boxes(glyphs)
+    # 3. Sort boxes before recognition.
     glyphs = sort_glyphs_rtl(glyphs)
 
+    # 4. Recognize batches after the permanent reading order is assigned.
+    for start in range(
+        0,
+        len(glyphs),
+        recognition_batch_size,
+    ):
+        batch = glyphs[
+            start:start + recognition_batch_size
+        ]
+
+        recognize_glyph_batch(
+            image_path=image_path,
+            glyphs=batch,
+            model=vision_model,
+        )
+
+    # Do not sort again after recognition.
     return glyphs
 
+def create_glyph_contact_sheet(
+    image_path: Path,
+    glyphs: list[DetectedGlyph],
+    *,
+    crop_size: int = 180,
+    columns: int = 5,
+    padding_ratio: float = 0.12,
+) -> bytes:
+    from PIL import Image, ImageDraw
+    import io
+    import math
 
+    source = Image.open(image_path).convert("RGB")
+
+    rows = math.ceil(len(glyphs) / columns)
+
+    label_height = 34
+    cell_width = crop_size
+    cell_height = crop_size + label_height
+
+    sheet = Image.new(
+        "RGB",
+        (columns * cell_width, rows * cell_height),
+        "white",
+    )
+
+    draw = ImageDraw.Draw(sheet)
+
+    for sheet_index, glyph in enumerate(glyphs):
+        pad_x = round(glyph.pw * padding_ratio)
+        pad_y = round(glyph.ph * padding_ratio)
+
+        x1 = max(0, glyph.px - pad_x)
+        y1 = max(0, glyph.py - pad_y)
+        x2 = min(
+            source.width,
+            glyph.px + glyph.pw + pad_x,
+        )
+        y2 = min(
+            source.height,
+            glyph.py + glyph.ph + pad_y,
+        )
+
+        crop = source.crop((x1, y1, x2, y2))
+        crop.thumbnail(
+            (crop_size - 16, crop_size - 16)
+        )
+
+        cell_x = (
+            sheet_index % columns
+        ) * cell_width
+
+        cell_y = (
+            sheet_index // columns
+        ) * cell_height
+
+        paste_x = (
+            cell_x
+            + (cell_width - crop.width) // 2
+        )
+
+        paste_y = (
+            cell_y
+            + label_height
+            + (crop_size - crop.height) // 2
+        )
+
+        sheet.paste(crop, (paste_x, paste_y))
+
+        # Display the permanent reading-order ID.
+        draw.text(
+            (cell_x + 8, cell_y + 7),
+            f"ID {glyph.order_id}",
+            fill="black",
+        )
+
+    buffer = io.BytesIO()
+    sheet.save(buffer, format="PNG")
+    return buffer.getvalue()
 # ============================================================
 # Cropping
 # ============================================================
