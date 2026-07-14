@@ -5,8 +5,9 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "sqlite" 
   url      = "file:./mojiji.db"
+  
 }
 
 model Copybook {
@@ -51,6 +52,8 @@ model Glyph {
   uploaderId String?
   page       CopybookPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
   createdAt  DateTime @default(now())
+
+
   @@index([character])
 }
 
