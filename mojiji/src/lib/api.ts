@@ -33,17 +33,16 @@ export async function getPageGlyphs(copybookId: string, pageId: string) {
   return res.json()
 }
 
-export async function pollPageProcessed(copybookId: string, pageId: string, maxWaitMs = 30000) {
-  const interval = 1000
+export async function pollPageProcessed(copybookId: string, pageId: string, maxWaitMs = 300000) {
+  const interval = 3000
   const start = Date.now()
   while (Date.now() - start < maxWaitMs) {
+    await new Promise(r => setTimeout(r, interval))
     const glyphs = await getPageGlyphs(copybookId, pageId)
     if (glyphs.length > 0) return glyphs
-    await new Promise(r => setTimeout(r, interval))
   }
   throw new Error('Segmentation timed out')
 }
-
 export function imageUrl(path: string) {
   if (path.startsWith('http')) return path
   return `${BASE}${path}`

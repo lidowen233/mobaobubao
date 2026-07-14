@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { buildGridPath, buildDiagPath, GRID_COLOR } from '@/lib/grid'
 import { useCompositionStore } from '@/store/compositionStore'
+import { useResizablePanel } from '@/hooks/useResizablePanel'
 import type { ScannedPage, ScannedGlyph } from '@/types/practice'
 
 interface Props {
@@ -9,12 +10,13 @@ interface Props {
 }
 
 const CELL_SIZE = 80
-const PREVIEW_SIZE = 200
+const PREVIEW_SIZE = 220
 
 export function PracticePage({ pages, onBack }: Props) {
   const { grid, paper } = useCompositionStore()
   const [activeGlyph, setActiveGlyph] = useState<ScannedGlyph | null>(null)
   const [activePage, setActivePage]   = useState(0)
+  const { width: previewWidth, onMouseDown } = useResizablePanel(280, 200, 520)
 
   const currentPage = pages[activePage]
   if (!currentPage) return null
@@ -27,17 +29,19 @@ export function PracticePage({ pages, onBack }: Props) {
   const glyphs = currentPage.glyphs
 
   // Group into columns for RTL display (same logic as PaperGrid)
-  const rows = 6
-  const numCols = Math.ceil(glyphs.length / rows)
-  const columns: (ScannedGlyph | null)[][] = []
-  for (let c = 0; c < numCols; c++) {
-    const col: (ScannedGlyph | null)[] = []
-    for (let r = 0; r < rows; r++) {
-      const i = c * rows + r
-      col.push(i < glyphs.length ? glyphs[i] : null)
-    }
-    columns.push(col)
-  }
+// Group by bboxX column (glyphs with similar x are in same column)
+const COL_TOLERANCE = 0.08
+const colMap = new Map<number, ScannedGlyph[]>()
+for (const g of glyphs) {
+  const cx = Math.round(g.bboxX / COL_TOLERANCE) * COL_TOLERANCE
+  const key = Math.round(cx * 100)
+  if (!colMap.has(key)) colMap.set(key, [])
+  colMap.get(key)!.push(g)
+}
+// Sort columns right to left (descending x), glyphs top to bottom within column
+const columns = [...colMap.entries()]
+  .sort((a, b) => b[0] - a[0])
+  .map(([, col]) => col.sort((a, b) => a.bboxY - b.bboxY) as (ScannedGlyph | null)[])
 
   return (
     <div style={{ display: 'flex', flex: 1, overflow: 'hidden', background: '#f5f1eb' }}>
@@ -67,10 +71,7 @@ export function PracticePage({ pages, onBack }: Props) {
           {columns.map((col, ci) => (
             <div key={ci} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               {col.map((glyph, ri) => {
-                if (!glyph) return (
-                  <div key={ri} style={{ width: CELL_SIZE, height: CELL_SIZE, opacity: 0.15,
-                    border: '1px dashed #c4b9ae', borderRadius: 4 }} />
-                )
+                if (!glyph) return <div key={ri} style={{ width: CELL_SIZE, height: CELL_SIZE }} />
                 const isActive = activeGlyph?.id === glyph.id
                 return (
                   <GlyphCell
@@ -89,11 +90,19 @@ export function PracticePage({ pages, onBack }: Props) {
         </div>
       </div>
 
-      {/* ── Divider ──────────────────────────────────────────────────────── */}
-      <div style={{ width: 1, background: '#d4ccc0', flexShrink: 0 }} />
+      {/* ── Drag divider ─────────────────────────────────────────────────── */}
+      <div
+        onMouseDown={onMouseDown}
+        style={{ width: 6, flexShrink: 0, cursor: 'col-resize', background: '#d4ccc0',
+          display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+        className="group"
+      >
+        <div style={{ width: 2, height: 32, borderRadius: 1, background: '#9b2335',
+          opacity: 0.3 }} className="group-hover:opacity-100 transition-opacity" />
+      </div>
 
       {/* ── Right: preview panel ─────────────────────────────────────────── */}
-      <div style={{ width: 260, flexShrink: 0, display: 'flex', flexDirection: 'column',
+      <div style={{ width: previewWidth, flexShrink: 0, display: 'flex', flexDirection: 'column',
         background: '#f5f1eb', overflow: 'hidden' }}>
 
         {/* header */}
@@ -122,13 +131,18 @@ export function PracticePage({ pages, onBack }: Props) {
 
             {/* large preview with grid overlay */}
             <div style={{ position: 'relative', width: PREVIEW_SIZE, height: PREVIEW_SIZE,
-              border: '1.5px solid #c4b9ae', borderRadius: 4, overflow: 'hidden', flexShrink: 0 }}>
+              border: '1.5px solid #c4b9ae', borderRadius: 4, overflow: 'hidden', flexShrink: 0,
+              background: '#faf5ec' }}>
 
-              {/* actual glyph image */}
+              {/* glyph image — inverted so always shows as dark ink on light paper */}
               <img
                 src={activeGlyph.imageUrl}
                 alt="字形"
-                style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain' }}
+                style={{
+                  position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain',
+                  filter: 'invert(1)',   // black bg → white, gold/white strokes → dark ink
+                  mixBlendMode: 'multiply',  // grid lines show through
+                }}
               />
 
               {/* grid overlay */}
@@ -192,7 +206,8 @@ function GlyphCell({ glyph, size, grid, gridColor, active, onClick }: {
       onMouseEnter={e => { if (!active) e.currentTarget.style.transform = 'scale(1.04)' }}
       onMouseLeave={e => { e.currentTarget.style.transform = 'scale(1)' }}
     >
-      <img src={glyph.imageUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+      <img src={glyph.imageUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'contain',
+        filter: 'invert(1)', mixBlendMode: 'multiply' }} />
       {grid !== 'none' && (
         <svg viewBox={`0 0 ${size} ${size}`} width={size} height={size}
           style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>

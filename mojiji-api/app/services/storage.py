@@ -52,9 +52,7 @@ def save_glyph_crop(crop: np.ndarray, copybook_id: str, character: str) -> Path:
     Save a cropped glyph image.
     Returns the saved path.
     """
-    # 用 unicode codepoint 做文件夹名，避免特殊字符问题
-    safe_name = f"U{ord(character):04X}" if character and character != "?" else "unknown"
-    dest_dir = GLYPH_DIR / copybook_id / safe_name
+    dest_dir = GLYPH_DIR / copybook_id / character
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     uid = uuid.uuid4().hex[:8]
