@@ -55,12 +55,12 @@ async def create_copybook(body: CopybookCreate):
     })
 
     return CopybookOut(
-        id=copybook.id,
-        title=copybook.title,
-        calligrapher=copybook.calligrapher,
-        dynasty=copybook.dynasty,
-        script=copybook.script,
-        source=copybook.source,
+        id=cb.id,
+        title=cb.title,
+        calligrapher=cb.calligrapher,
+        dynasty=cb.dynasty,
+        script=cb.script,
+        source=cb.source,
     )
 
 
@@ -130,7 +130,7 @@ async def upload_page(
 
     )
 
-    if not copybook:
+    if not cb:
         raise HTTPException(
             status_code=404,
             detail="Copybook not found",

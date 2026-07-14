@@ -13,7 +13,7 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 from dotenv import load_dotenv
-
+from functools import lru_cache
 load_dotenv()
 
 

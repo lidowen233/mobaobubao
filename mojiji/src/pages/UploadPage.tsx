@@ -3,7 +3,7 @@ import {
   createCopybook,
   imageUrl,
   pollPageProcessed,
-  recognizePage,
+ 
   uploadPage,
 } from '@/lib/api'
 import type { ScannedPage, ScannedGlyph } from '@/types/practice'
