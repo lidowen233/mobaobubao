@@ -1,14 +1,8 @@
 import { useState, useRef } from 'react'
-import {
-  createCopybook,
-  imageUrl,
-  pollPageProcessed,
- 
-  uploadPage,
-} from '@/lib/api'
+import { createCopybook, uploadPage, pollPageProcessed, imageUrl } from '@/lib/api'
 import type { ScannedPage, ScannedGlyph } from '@/types/practice'
 
-type Step = 'form' | 'scanning' | 'review' | 'recognizing' | 'error'
+type Step = 'form' | 'scanning' | 'error'
 
 interface Props {
   onScanComplete: (pages: ScannedPage[]) => void
@@ -27,8 +21,6 @@ export function UploadPage({ onScanComplete }: Props) {
   const [scanMsg, setScanMsg] = useState('正在上传...')
   const [errorMsg, setErrorMsg] = useState('')
   const [progress, setProgress] = useState(0)
-  const [copybookId, setCopybookId] = useState('')
-  const [detectedPages, setDetectedPages] = useState<ScannedPage[]>([])
 
   // form state
   const [title,        setTitle]        = useState('')
@@ -53,7 +45,6 @@ export function UploadPage({ onScanComplete }: Props) {
       // 1. Create copybook
       setScanMsg('建立字帖档案...')
       const cb = await createCopybook({ title, calligrapher, dynasty: dynasty || undefined, script })
-      setCopybookId(cb.id)
 
       // 2. Upload each page
       const scannedPages: ScannedPage[] = []
@@ -68,10 +59,7 @@ export function UploadPage({ onScanComplete }: Props) {
         setScanMsg(`扫描第 ${i + 1} 页字形...`)
         setProgress(Math.round((40 + (i / files.length) * 50)))
 
-        const detection = await pollPageProcessed<ScannedGlyph>(cb.id, pageData.pageId)
-        if (detection.status !== 'completed') {
-          throw new Error(detection.message ?? '字形检测尚未完成')
-        }
+        const glyphs = await pollPageProcessed(cb.id, pageData.pageId)
 
         scannedPages.push({
           id:         pageData.pageId,
@@ -79,7 +67,7 @@ export function UploadPage({ onScanComplete }: Props) {
           imageUrl:   imageUrl(pageData.imageUrl),
           width:      pageData.width,
           height:     pageData.height,
-          glyphs:     detection.glyphs.map((g: ScannedGlyph) => ({
+          glyphs:     (glyphs as ScannedGlyph[]).map((g: ScannedGlyph) => ({
             ...g,
             imageUrl: imageUrl(g.imageUrl),
           })),
@@ -87,8 +75,9 @@ export function UploadPage({ onScanComplete }: Props) {
       }
 
       setProgress(100)
-      setDetectedPages(scannedPages)
-      setStep('review')
+      setScanMsg('扫描完成！')
+      await new Promise(r => setTimeout(r, 600))
+      onScanComplete(scannedPages)
 
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : '未知错误')
@@ -96,38 +85,8 @@ export function UploadPage({ onScanComplete }: Props) {
     }
   }
 
-  async function handleRecognize() {
-    setStep('recognizing')
-    setProgress(0)
-
-    try {
-      const recognizedPages: ScannedPage[] = []
-
-      for (let i = 0; i < detectedPages.length; i++) {
-        const page = detectedPages[i]
-        setScanMsg(`识别第 ${i + 1} / ${detectedPages.length} 页...`)
-        setProgress(Math.round((i / detectedPages.length) * 100))
-
-        const result = await recognizePage<ScannedGlyph>(copybookId, page.id)
-        recognizedPages.push({
-          ...page,
-          glyphs: result.glyphs.map(glyph => ({
-            ...glyph,
-            imageUrl: imageUrl(glyph.imageUrl),
-          })),
-        })
-      }
-
-      setProgress(100)
-      onScanComplete(recognizedPages)
-    } catch (e) {
-      setErrorMsg(e instanceof Error ? e.message : '识字失败')
-      setStep('error')
-    }
-  }
-
   // ── Scanning animation ────────────────────────────────────────────────────
-  if (step === 'scanning' || step === 'recognizing') {
+  if (step === 'scanning') {
     return (
       <div className="flex-1 flex flex-col items-center justify-center gap-8"
         style={{ background: '#f5f1eb' }}>
@@ -153,9 +112,7 @@ export function UploadPage({ onScanComplete }: Props) {
           <p style={{ fontFamily: "'Kaiti SC','KaiTi',serif", fontSize: 18, color: '#120a02', marginBottom: 6 }}>
             {scanMsg}
           </p>
-          <p style={{ fontSize: 12, color: '#9a8a78' }}>
-            {step === 'scanning' ? '正在检测字形边框，请稍候' : '正在识别已确认的字形'}
-          </p>
+          <p style={{ fontSize: 12, color: '#9a8a78' }}>正在识别字形，请稍候</p>
         </div>
 
         {/* scanning line animation */}
@@ -164,59 +121,6 @@ export function UploadPage({ onScanComplete }: Props) {
             height: '100%', background: '#9b2335', borderRadius: 1,
             width: `${progress}%`, transition: 'width 0.4s ease',
           }} />
-        </div>
-      </div>
-    )
-  }
-
-  // ── Detection review ─────────────────────────────────────────────────────
-  if (step === 'review') {
-    return (
-      <div className="flex-1 overflow-auto p-8" style={{ background: '#f5f1eb' }}>
-        <div style={{ maxWidth: 980, margin: '0 auto' }}>
-          <h2 style={{ fontFamily: "'Kaiti SC','KaiTi',serif", fontSize: 20, color: '#120a02' }}>
-            检查字形边框
-          </h2>
-          <p style={{ margin: '6px 0 20px', fontSize: 13, color: '#76695c' }}>
-            当前仅完成 YOLO 检测，尚未调用识字模型。确认边框后再开始识字。
-          </p>
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 20 }}>
-            {detectedPages.map(page => (
-              <div key={page.id} style={{ background: '#faf5ec', border: '1px solid #d4ccc0', borderRadius: 8, padding: 12 }}>
-                <div style={{ fontSize: 12, color: '#76695c', marginBottom: 8 }}>
-                  第 {page.pageNumber} 页 · 检测到 {page.glyphs.length} 个字形
-                </div>
-                <div style={{ position: 'relative', lineHeight: 0 }}>
-                  <img src={page.imageUrl} alt={`第 ${page.pageNumber} 页`} style={{ width: '100%', height: 'auto', display: 'block' }} />
-                  {page.glyphs.map((glyph, index) => (
-                    <div
-                      key={glyph.id}
-                      title={`顺序 ${index + 1}`}
-                      style={{
-                        position: 'absolute',
-                        left: `${glyph.bboxX * 100}%`,
-                        top: `${glyph.bboxY * 100}%`,
-                        width: `${glyph.bboxW * 100}%`,
-                        height: `${glyph.bboxH * 100}%`,
-                        border: '1.5px solid #9b2335',
-                        boxSizing: 'border-box',
-                      }}
-                    />
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 24 }}>
-            <button onClick={() => setStep('form')} style={{ ...btnStyle, background: '#76695c' }}>
-              返回
-            </button>
-            <button onClick={handleRecognize} style={btnStyle}>
-              确认边框并开始识字
-            </button>
-          </div>
         </div>
       </div>
     )
