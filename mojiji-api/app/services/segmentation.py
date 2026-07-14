@@ -6,26 +6,15 @@ Simple and direct: send image, get back per-character bbox + content.
 import os
 import base64
 import json
-
 import httpx
 import cv2
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 from dotenv import load_dotenv
-from functools import lru_cache
+
 load_dotenv()
 
-
-from dotenv import load_dotenv
-load_dotenv()
-
-@lru_cache(maxsize=2)
-def _load_yolo_model(model_path: str):
-    """Load and cache a YOLO model."""
-    from ultralytics import YOLO
-
-    return YOLO(model_path)
 
 @dataclass
 class DetectedGlyph:
@@ -33,11 +22,6 @@ class DetectedGlyph:
     x: float; y: float; w: float; h: float
     confidence: float
     character: str = "?"
-    # Permanent reading-order index
-    order_id: int = -1
-
-    # Column index; 0 is the rightmost column
-    column_id: int = -1
 
 
 def _encode_image(image_path: Path, max_size: int = 1500) -> tuple[str, str]:
@@ -60,7 +44,6 @@ PROMPT = """请分析这张书法图片，识别每个汉字的位置。
 
 w 和 h 请根据每个字的实际大小填写。只返回 JSON，不要其他文字。
 注意：请确保识别图片中所有列的所有汉字，不要遗漏最左边的列。"""
-
 
 
 def segment_page(image_path: Path) -> list[DetectedGlyph]:
@@ -141,37 +124,7 @@ def segment_page(image_path: Path) -> list[DetectedGlyph]:
             character=char,
         ))
 
-
-    # 4. Recognize batches after the permanent reading order is assigned.
-    for start in range(
-        0,
-        len(glyphs),
-        recognition_batch_size,
-    ):
-        batch = glyphs[
-            start:start + recognition_batch_size
-        ]
-
-        recognize_glyph_batch(
-            image_path=image_path,
-            glyphs=batch,
-            model=vision_model,
-        )
-
-    # Do not sort again after recognition.
     return glyphs
-
-def create_glyph_contact_sheet(
-    image_path: Path,
-    glyphs: list[DetectedGlyph],
-    *,
-    crop_size: int = 180,
-    columns: int = 5,
-    padding_ratio: float = 0.12,
-) -> bytes:
-    from PIL import Image, ImageDraw
-    import io
-    import math
 
 
 def sort_glyphs_rtl(glyphs: list[DetectedGlyph], col_tolerance: float = 0.06) -> list[DetectedGlyph]:
@@ -181,7 +134,6 @@ def sort_glyphs_rtl(glyphs: list[DetectedGlyph], col_tolerance: float = 0.06) ->
         cx = g.x + g.w / 2
         return int((1.0 - cx) / col_tolerance)
     return sorted(glyphs, key=lambda g: (col_index(g), g.y))
-
 
 
 def crop_glyph(image_path: Path, glyph: DetectedGlyph, padding: float = 0.08) -> np.ndarray:
