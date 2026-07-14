@@ -34,7 +34,13 @@ async def save_page_image(file: UploadFile, copybook_id: str, page_number: int) 
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise StorageError("Cannot decode image")
+    # 确保图片最小宽度 1000px，太小的图放大
+    min_size = 1000
     h, w = img.shape[:2]
+    if w < min_size:
+        scale = min_size / w
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+        h, w = img.shape[:2]
 
     # Save as high-quality JPEG
     dest_dir = PAGE_DIR / copybook_id

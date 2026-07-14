@@ -140,12 +140,15 @@ def crop_glyph(image_path: Path, glyph: DetectedGlyph, padding: float = 0.08) ->
     img = cv2.imread(str(image_path))
     ih, iw = img.shape[:2]
 
-    pad_x = int(glyph.pw * padding)
-    pad_y = int(glyph.ph * padding)
-    x1 = max(0, glyph.px - pad_x)
-    y1 = max(0, glyph.py - pad_y)
-    x2 = min(iw, glyph.px + glyph.pw + pad_x)
-    y2 = min(ih, glyph.py + glyph.ph + pad_y)
+    # 用字高估算字宽（书法字接近正方形），取 max
+    char_size = max(glyph.pw, glyph.ph)
+    
+    pad = int(char_size * padding)
+    x1 = max(0, glyph.px - pad)
+    y1 = max(0, glyph.py - pad)
+    # x 方向用 char_size 而不是 pw，保证够宽
+    x2 = min(iw, glyph.px + char_size + pad)
+    y2 = min(ih, glyph.py + glyph.ph + pad)
 
     crop = img[y1:y2, x1:x2]
     if crop.size == 0:
